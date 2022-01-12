@@ -1,1 +1,1 @@
-# research-project-sketchformer
+# Research Project - Sketchformer (VICG)
