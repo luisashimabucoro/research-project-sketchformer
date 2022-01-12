@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-# research-project-sketchformer
+# Research Project - Sketchformer (VICG)
 ## Notes on server usage
 
 ![Pokemons](images/pokemons.png)
-=======
-# Research Project - Sketchformer (VICG)
->>>>>>> d43279a54fdc7ec6e4548ee8b4aa2864004d8219
