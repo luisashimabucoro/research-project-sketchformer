@@ -1,0 +1,15 @@
+{
+ "optimizer": "Adam",
+ "learning_rate": 0.001,
+ "loss": "categorical_crossentropy",
+ "batch_size": 64,
+ "iterations": 100000,
+ "save_every": 20000,
+ "safety_save": 10000,
+ "autograph": true,
+ "log_every": 100,
+ "notify_every": 1000,
+ "slack_config": "",
+ "goal": "No description",
+ "distribute": false
+}
