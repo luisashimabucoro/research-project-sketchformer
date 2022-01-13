@@ -40,16 +40,15 @@ def create_example(image, label):
     """
     Creates a tf.train.Example out of the sketches from the
     QuickDraw dataset
+
+    image : strokes (delta x, delta y, binary pen state)
+    label : class of the given sketch
     """
-    # print(image.tostring())
-    # print()
-    # print(image.shape)
 
     # dict of features which compose the example
     feature = {
         'label' : _int64_feature(label),
         'size' : _int64_feature(image.shape[0]),
-        'dimension' : _int64_feature(3),
         'image' : _bytes_feature(image.tostring())
     }
 
@@ -60,6 +59,12 @@ def convert_dataset_in_chunks(set_type, idx_to_classes, class_files, n_chunks, d
     """
     Function used to convert to dataset into the TFRecord format in
     chunks
+
+    set_type : type of data (training, validation, test)
+    idx_to_classes : index of each class in the class list
+    class_files : path for each class file
+    n_chunks : number of chunks the data will be divided into
+    datapath : path of where the converted files will be stored
     """
 
     # dividing the TFRecords in 1 or more chunks
@@ -84,6 +89,7 @@ def convert_dataset_in_chunks(set_type, idx_to_classes, class_files, n_chunks, d
                 start = n_samples * chunk
                 end = start + n_samples
                 samples = data[set_type][start:end]
+                
                 labels = np.ones((n_samples,), dtype=int) * i
                 class_shards.append((samples, labels))
 
@@ -103,18 +109,19 @@ def parse_quickdraw_image(example):
     Function used to parse the TFRecords Examples 
     via deserialization, returning the reconstructed
     image and its corresponding label
+
+    example : TFRecord example
     """
 
     image_feature_description = {
         'label' : tf.io.FixedLenFeature([], tf.int64),
         'size' : tf.io.FixedLenFeature([], tf.int64),
-        'dimension' : tf.io.FixedLenFeature([], tf.int64),
         'image' : tf.io.FixedLenSequenceFeature([], tf.int16, allow_missing=True)
     }
 
     # parsing and reconstructing the sketch
     parsed_example = tf.io.parse_single_example(example, image_feature_description)
-    sketch = tf.reshape(parsed_example['image'], [parsed_example['size'], parsed_example['size'], parsed_example['dimension']])
+    sketch = tf.reshape(parsed_example['image'], [parsed_example['size'], 3])
     
     return sketch, parsed_example['label']
 
