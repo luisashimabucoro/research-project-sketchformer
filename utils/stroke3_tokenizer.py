@@ -1,7 +1,98 @@
+"""
+- funcão de encoding parece funcionar bem mas a de decoding não (?)
+"""
+
 import numpy as np
 import pandas as pd
 
+def find_min_max(strokes):
+    max = -1000
+
+    for i in range(len(strokes)):
+      abs_array = np.absolute(strokes[i])
+      if np.max(abs_array) > max:
+        max = np.max(abs_array)
+
+    return max
+
+
+def normalize_strokes(strokes):
+    """
+    Normalize strokes and set their values between a [-1,1] range
+    """
+    scale = find_min_max(strokes)
+
+    # print("Scale:", scale)
+    for i in range(len(strokes)):
+        # print(np.max(scale,axis=0))
+        strokes[i] /= np.max(scale,axis=0)
+        # strokes[i] /= np.max(strokes[i],axis=0)
+        # strokes[i] = (strokes[i] - np.min(strokes[i])) / (np.max(strokes[i]) - np.min(strokes[i]))
+        # print(strokes)
+
+    return (scale, strokes)
+
+
+def get_sketch_coordinates(sketch, scale_factor=1.0, start_from_origin=False):
+    """
+    This method takes the sketch in stroke3 format and 
+    calculates the coordinates of the points which compose
+    each stroke. 
+
+    sketch : sketch in stroke3 format
+    scale_factor : factor by which the coordinates can be scaled
+    start_from_origin : boolean value which determines whether the
+                        sketch starts from the origin (0,0) or not
+
+    return : list of strokes, being that each stroke is composed of
+             n (x,y) coordinates 
+    """
+    x_coord = 0
+    y_coord = 0
+    dx = 0
+    dy = 0
+
+    strokes = []
+    stroke = [[0, 0]] if start_from_origin else []
+    for i in range(len(sketch)):
+        dx, dy = sketch[i, :2] * scale_factor
+        
+        x_coord += dx
+        y_coord += dy
+        stroke.append([x_coord, y_coord])
+
+        if sketch[i, 2] == 1:
+            final_stroke = np.array(stroke) + np.zeros((1, 2), dtype=np.uint8)
+            strokes.append(final_stroke)
+            stroke = []
+    
+    return strokes
+
+def coordinates_to_stroke3(coords, omit_first_point=True):
+    """
+    Convert sketch coordinates into original stroke3 format
+
+    coords: list of coords (x,y)
+    """
+    strokes = []
+    for coord in coords:
+        coord_len = len(coord)
+        for i in range(coord_len):
+            eos = 0 if i < coord_len - 1 else 1
+            strokes.append([coord[i][0], coord[i][1], eos])
+
+    strokes = np.array(strokes)
+    strokes[1:, 0:2] -= strokes[:-1, 0:2]
+
+    return strokes[1:, :] if omit_first_point else strokes
+
 class GridTokenizer(object):
+    """
+    Grid Tokenizer
+
+    The sketch is divided into several grid cells and each cell is associated 
+    with a token.
+    """
 
     def __init__(self, resolution=100, max_seq_len=0):
         """
@@ -21,69 +112,107 @@ class GridTokenizer(object):
         self.SEP = self.resolution**2 + 1
         self.SOS = self.SEP + 1
         self.EOS = self.SEP + 2
-        self.PAD = -2
+        self.PAD = 0
 
         self.VOCAB_SIZE = self.resolution**2 + 4
 
-    def strokes_to_lines(self, strokes, scale=1.0, start_from_origin=False):
-        """
-        convert strokes3 to polyline format ie. absolute x-y coordinates
-        note: the sketch can be negative
-        :param strokes: stroke3, Nx3
-        :param scale: scale factor applied on stroke3
-        :param start_from_origin: sketch starts from [0,0] if True
-        :return: list of strokes, each stroke has format Nx2
-        """
-        x = 0
-        y = 0
-        lines = []
-        line = [[0, 0]] if start_from_origin else []
-        for i in range(len(strokes)):
-            x_, y_ = strokes[i, :2] * scale
-            x += x_
-            y += y_
-            line.append([x, y])
-            if strokes[i, 2] == 1:
-                line_array = np.array(line) + np.zeros((1, 2), dtype=np.uint8)
-                lines.append(line_array)
-                line = []
-        if lines == []:
-            line_array = np.array(line) + np.zeros((1, 2), dtype=np.uint8)
-            lines.append(line_array)
-        return lines
 
-    # Takes strokes from a sketch and converts them to tokens
-    # 1 - 
     def encode(self, sketch, seq_len=0):
-        r = self.strokes_to_lines(sketch, 1.0)
-        print(r)
+      """
+        The enconding process works as follows: we take the sketch representation
+        in the stroke3 format and convert it into (x,y) coordinates, which should 
+        be followed by a normalization so as to convert the values into tokens properly.
+        We then multiply each coordinate by the radius so as to convert them
+        into the nxn proportion (considering both negative and positive numbers).
+        Then theses values are added up, finally representing the tokens associated
+        with each coordinate, which form a stroke.
 
-        # stroke3s -> tokens
-        out = []
-        for stroke in r:
-            print(stroke[:, 0])
-            x_t = np.int64((stroke[:, 0] + 1) * self.radius)
-            x_t[x_t == self.resolution] = self.resolution - 1  # deal with upper bound
-            print(x_t)
-            y_t = np.int64((stroke[:, 1] + 1) * self.radius)
-            y_t[y_t == self.resolution] = self.resolution - 1
-            print(y_t)
-            t_id = x_t + y_t * self.resolution
-            t_id = list(t_id + 1) + [self.SEP]  # shift by 1 to reserve id 0 for PAD
-            print(t_id)
-            out.extend(t_id)
-        out = [self.SOS] + out + [self.EOS]
-        if self.max_seq_len:  # pad
-            npad = self.max_seq_len - len(out)
-            if npad > 0:
-                out += [self.PAD] * npad
-            else:
-                out = out[:self.max_seq_len]
-                out[-2:] = [self.SEP, self.EOS]
-        if len(out) < seq_len:
-            out += [self.PAD] * (seq_len-len(out))
-        return np.array(out)
+        Note that the special tokens must be used to organize the final output and 
+        the padding is used to give the strokes the same size in order to make them
+        uniform.
 
+        sketch : drawing in stroke3 format
+        seq_len : predefined sequence length
+
+        return : 
+      """
+      strokes = get_sketch_coordinates(sketch)
+      # print(strokes)
+      # print("Sketch coords:", strokes)
+      norm_scale, strokes = normalize_strokes(strokes)
+      # print("Normalized coords:", strokes)
+
+      tokenized_sketch = []
+      for stroke in strokes:
+        x_tokens = np.int64((stroke[:, 0] + 1) * self.radius)  # we add 1 to the coordinates E [-1,1] so the token values stay between [0,resolution]
+        x_tokens[x_tokens == self.resolution] = self.resolution - 1  # if the resulting value is 100 then we subtract one in order to deal with the upper bound
+        # print(x_tokens)
+        y_tokens = np.int64((stroke[:, 1] + 1) * self.radius)
+        y_tokens[y_tokens == self.resolution] = self.resolution - 1
+
+        stroke_tokens = (x_tokens * self.resolution) + y_tokens  # by adding x and y values this way we can decode the tokens using the quotient and the remainder
+        stroke_tokens = list(stroke_tokens + 1) + [self.SEP]  # the tokens start from 1 in order for us to use 0 as out padding special token
+        tokenized_sketch.extend(stroke_tokens)
+
+      # adding beggining and ending special tokens
+      tokenized_sketch = [self.SOS] + tokenized_sketch + [self.EOS]
+
+      # here we add padding if necessary
+      if self.max_seq_len > 0: 
+          units_padding = self.max_seq_len - len(tokenized_sketch)
+          if units_padding > 0:
+              tokenized_sketch += [self.PAD] * units_padding
+          else:
+              tokenized_sketch = tokenized_sketch[:self.max_seq_len]
+              tokenized_sketch[-2:] = [self.SEP, self.EOS]
+
+      if len(tokenized_sketch) < seq_len:
+          tokenized_sketch += [self.PAD] * (seq_len - len(tokenized_sketch))
+
+      return (norm_scale, np.array(tokenized_sketch))
+
+    def decode(self, sketches):
+        if len(sketches) > 0 and isinstance(sketches[0], (list, tuple, np.ndarray)):
+            return self.decode_list(sketches[0], sketches[1])
+        else:
+            return self.decode_single(sketches[0], sketches[1])
+
+    def decode_single(self, tokenized_sketch, norm_scale):
+        """
+        When it comes to the decoding part (tokens -> stroke3) we take 
+        the quotient to represent one coordinate value and the module to  
+        represent the other and then divide it by the radius so we can 
+        convert the value to its original [-1,1] normalized scale.
+
+        tokenized_sketch: tokenized sketch comprised of n tokenized strokes
+        
+        return : decoded sketch in stroke3 format
+        """
+
+        stroke3_sketch = []
+        stroke = []
+        for token in tokenized_sketch:
+            # print(token)
+            # print()
+            # print(norm_scale)
+            if 0 < token < self.SEP:  # checks if token is not a special token
+                x_coords = (token - 1) // self.resolution
+                # print(x_coords)
+                x_coords = ((x_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale
+                # print(x_coords)
+                y_coords = (token - 1) % self.resolution  # the 1 we added to reserve the 0 for padding is subtracted
+                y_coords = ((y_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale # we subtract 1 so the values range from [-1,1] instead of [0,1] as was the case in the encoding
+
+                stroke.append(np.array([x_coords, y_coords]))
+            elif token == self.SEP and stroke:
+                stroke3_sketch.append(np.array(stroke))
+                stroke = []
+            elif token == self.EOS:
+                break
+        # print(stroke3_sketch)
+        stroke3_sketch = coordinates_to_stroke3(stroke3_sketch, omit_first_point=False)
+        # print(stroke3)
+        return stroke3_sketch
 
 def main():
 
@@ -94,11 +223,11 @@ def main():
             stroke3.append(list(map(float, line.rstrip().split(' '))))
     
     example = np.array(stroke3)
-    # print(example)
-    # print(np.int64(example[:, 0]))
 
-    tok = GridTokenizer()      
-    print(tok.encode(example, seq_len=0))
+    tok = GridTokenizer(max_seq_len=100)      
+    scale, sketch = tok.encode(example)
+    print(sketch)
+    print(tok.decode_single(sketch, scale))
 
 
 if __name__ == "__main__":
