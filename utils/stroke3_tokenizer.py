@@ -1,9 +1,7 @@
-"""
-- funcão de encoding parece funcionar bem mas a de decoding não (?)
-"""
-
 import numpy as np
 import pandas as pd
+from sketch import convert_sketch_from_stroke3_to_image
+from PIL import Image
 
 def find_min_max(strokes):
     max = -1000
@@ -22,16 +20,10 @@ def normalize_strokes(strokes):
     """
     scale = find_min_max(strokes)
 
-    # print("Scale:", scale)
     for i in range(len(strokes)):
-        # print(np.max(scale,axis=0))
         strokes[i] /= np.max(scale,axis=0)
-        # strokes[i] /= np.max(strokes[i],axis=0)
-        # strokes[i] = (strokes[i] - np.min(strokes[i])) / (np.max(strokes[i]) - np.min(strokes[i]))
-        # print(strokes)
 
     return (scale, strokes)
-
 
 def get_sketch_coordinates(sketch, scale_factor=1.0, start_from_origin=False):
     """
@@ -86,6 +78,20 @@ def coordinates_to_stroke3(coords, omit_first_point=True):
 
     return strokes[1:, :] if omit_first_point else strokes
 
+def stroke3_to_image(sketch, scale, file_name="test.png", image_resolution=1000):
+    sketch[:, :2] = sketch[:, :2] / scale
+
+    img_array = convert_sketch_from_stroke3_to_image(sketch, image_resolution) 
+    img_array = (img_array * 255.0).astype(np.uint8)
+    img_array = np.squeeze(img_array)
+
+    img = Image.fromarray(img_array, 'L')
+    img.save(file_name)
+
+
+
+
+
 class GridTokenizer(object):
     """
     Grid Tokenizer
@@ -134,19 +140,15 @@ class GridTokenizer(object):
         sketch : drawing in stroke3 format
         seq_len : predefined sequence length
 
-        return : 
+        return : tuple consisting of the scale factor and the tokenized sketch
       """
       strokes = get_sketch_coordinates(sketch)
-      # print(strokes)
-      # print("Sketch coords:", strokes)
       norm_scale, strokes = normalize_strokes(strokes)
-      # print("Normalized coords:", strokes)
 
       tokenized_sketch = []
       for stroke in strokes:
         x_tokens = np.int64((stroke[:, 0] + 1) * self.radius)  # we add 1 to the coordinates E [-1,1] so the token values stay between [0,resolution]
         x_tokens[x_tokens == self.resolution] = self.resolution - 1  # if the resulting value is 100 then we subtract one in order to deal with the upper bound
-        # print(x_tokens)
         y_tokens = np.int64((stroke[:, 1] + 1) * self.radius)
         y_tokens[y_tokens == self.resolution] = self.resolution - 1
 
@@ -192,16 +194,11 @@ class GridTokenizer(object):
         stroke3_sketch = []
         stroke = []
         for token in tokenized_sketch:
-            # print(token)
-            # print()
-            # print(norm_scale)
             if 0 < token < self.SEP:  # checks if token is not a special token
-                x_coords = (token - 1) // self.resolution
-                # print(x_coords)
-                x_coords = ((x_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale
-                # print(x_coords)
-                y_coords = (token - 1) % self.resolution  # the 1 we added to reserve the 0 for padding is subtracted
-                y_coords = ((y_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale # we subtract 1 so the values range from [-1,1] instead of [0,1] as was the case in the encoding
+                x_coords = (token - 1) // self.resolution  # the 1 we added to reserve the 0 for padding is subtracted
+                x_coords = ((x_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale  # we subtract 1 so the values range from [-1,1] instead of [0,1] as was the case in the encoding
+                y_coords = (token - 1) % self.resolution  
+                y_coords = ((y_coords / self.radius) - 1 + self.radius_grid_cell) * norm_scale 
 
                 stroke.append(np.array([x_coords, y_coords]))
             elif token == self.SEP and stroke:
@@ -209,10 +206,12 @@ class GridTokenizer(object):
                 stroke = []
             elif token == self.EOS:
                 break
-        # print(stroke3_sketch)
+
         stroke3_sketch = coordinates_to_stroke3(stroke3_sketch, omit_first_point=False)
-        # print(stroke3)
         return stroke3_sketch
+
+
+
 
 def main():
 
@@ -221,14 +220,23 @@ def main():
         lines = sketch.readlines()
         for line in lines:
             stroke3.append(list(map(float, line.rstrip().split(' '))))
-    
+
     example = np.array(stroke3)
+    print('Original sketch:\n')
+    print(example, '\n')
 
-    tok = GridTokenizer(max_seq_len=100)      
-    scale, sketch = tok.encode(example)
-    print(sketch)
-    print(tok.decode_single(sketch, scale))
+    grid_tok = GridTokenizer(max_seq_len=1000, resolution=10000)      
+    scale, sketch = grid_tok.encode(example)
+    print('Encoded sketch:\n')
+    print(sketch, '\n')
 
+    decoded_sketch = grid_tok.decode_single(sketch, scale)
+    print('Decoded sketch:\n')
+    print(decoded_sketch, '\n')
+
+    stroke3_to_image(decoded_sketch, scale, file_name='decoded_eiffel_tower_10000_res.png')
 
 if __name__ == "__main__":
     main()
+
+    
