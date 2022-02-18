@@ -35,8 +35,13 @@ def serialize_array(array):
   array = tf.io.serialize_tensor(array)
   return array
 
+def _float32_image_feature(value):
+    return tf.train.Feature(float_list=tf.train.FloatList(value=value.flatten()))
 
-def create_example(image, label):
+
+
+
+def create_example(sketch, label):
     """
     Creates a tf.train.Example out of the sketches from the
     QuickDraw dataset
@@ -45,15 +50,14 @@ def create_example(image, label):
     label : class of the given sketch
     """
 
-    # dict of features which compose the example
-    feature = {
-        'label' : _int64_feature(label),
-        'size' : _int64_feature(image.shape[0]),
-        'image' : _bytes_feature(image.tostring())
+    features = {
+        'sketch' : _float32_image_feature(sketch),
+        'sketch_size' : _int64_feature(sketch.shape[0]),
+        'label' : _int64_feature(label)
     }
 
     # converting features into a single example
-    return tf.train.Example(features=tf.train.Features(feature=feature))
+    return tf.train.Example(features=tf.train.Features(feature=features))
 
 def convert_dataset_in_chunks(set_type, idx_to_classes, class_files, n_chunks, datapath):
     """
@@ -69,7 +73,7 @@ def convert_dataset_in_chunks(set_type, idx_to_classes, class_files, n_chunks, d
 
     # dividing the TFRecords in 1 or more chunks
     for chunk in range(0, n_chunks):
-        # openign the data files
+        # opening the data files
         tf_record_shard_path = os.path.join(datapath, "{}{:03}.records".format(set_type, chunk))
         options = tf.io.TFRecordOptions(compression_type="GZIP")
         with tf.io.TFRecordWriter(tf_record_shard_path, options) as writer:
@@ -91,17 +95,29 @@ def convert_dataset_in_chunks(set_type, idx_to_classes, class_files, n_chunks, d
                 samples = data[set_type][start:end]
                 
                 labels = np.ones((n_samples,), dtype=int) * i
+
                 class_shards.append((samples, labels))
+            
 
             # shuffle the shards
             random.shuffle(class_shards)
 
             # take one sample from each shard at a time, mixing all of them
-            for cur_index in range(n_samples):
-                for samples, labels in class_shards:
-                    tf_example = create_example(samples, labels[cur_index])
-                    writer.write(tf_example.SerializeToString())
-                print("Saved {}/{} samples from each class shard".format(cur_index, n_samples))
+            # 345 classes with 2500 sketches each
+            for samples, labels in class_shards:
+                cur_index = 0
+                # print(samples.shape)
+                for sample in samples:
+                    tf_example = create_example(sample, labels[cur_index])
+                    serialized = tf_example.SerializeToString()
+                    writer.write(serialized)
+
+                    # print(tf.train.Example.FromString(serialized))
+                    # s, l = parse_quickdraw_image(serialized)
+                    # print('Resultados:',s, l)
+                    print("Saved {}/{} samples from each class shard".format(cur_index+1, n_samples))
+                    cur_index += 1
+            
 
 
 def parse_quickdraw_image(example): 
@@ -114,16 +130,23 @@ def parse_quickdraw_image(example):
     """
 
     image_feature_description = {
-        'label' : tf.io.FixedLenFeature([], tf.int64),
-        'size' : tf.io.FixedLenFeature([], tf.int64),
-        'image' : tf.io.FixedLenSequenceFeature([], tf.int16, allow_missing=True)
+        'sketch' : tf.io.VarLenFeature(tf.float32),
+        'sketch_size' : tf.io.FixedLenFeature([], tf.int64),
+        'label' : tf.io.FixedLenFeature([], tf.int64)
     }
 
     # parsing and reconstructing the sketch
     parsed_example = tf.io.parse_single_example(example, image_feature_description)
-    sketch = tf.reshape(parsed_example['image'], [parsed_example['size'], 3])
-    
+    sketch = tf.reshape(parsed_example['sketch'].values, [parsed_example['sketch_size'], 3])
+
     return sketch, parsed_example['label']
+
+def parse_dataset(filename):
+    raw_dataset = tf.data.TFRecordDataset(filename, compression_type='GZIP')
+
+    parsed_dataset = raw_dataset.map(parse_quickdraw_image)
+
+    return parsed_dataset
 
 def main():
     # argument parser responsible for collecting key info for the data extraction and conversion
@@ -159,9 +182,12 @@ def main():
         json.dump(metadata, outfile)
     
     # calling the conversion functions to store the data in the TFRecord format
-    convert_dataset_in_chunks('valid', idx_to_classes, class_files, 1, args.target_dir)
-    convert_dataset_in_chunks('test', idx_to_classes, class_files, 1, args.target_dir)
-    convert_dataset_in_chunks('train', idx_to_classes, class_files, 10, args.target_dir)
+    # convert_dataset_in_chunks('valid', idx_to_classes, class_files, 1, args.target_dir)
+    # convert_dataset_in_chunks('test', idx_to_classes, class_files, 1, args.target_dir)
+    # convert_dataset_in_chunks('train', idx_to_classes, class_files, 10, args.target_dir)
+    dataset = parse_dataset('/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/valid000.records').shuffle(buffer_size=345*2500)
+    for record in dataset.take(10):
+        print(record, '\n')
 
 if __name__ == '__main__':
     main()

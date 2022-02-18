@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 from sketch import convert_sketch_from_stroke3_to_image
 from PIL import Image
 
@@ -210,6 +209,14 @@ class GridTokenizer(object):
         stroke3_sketch = coordinates_to_stroke3(stroke3_sketch, omit_first_point=False)
         return stroke3_sketch
 
+    def decode_list(self, sketches):
+        decoded_sketches = []
+        for sketch in sketches:
+            try:
+                decoded_sketches.append(self.decode_single(np.squeeze(sketch)))
+            except:
+                continue
+        return decoded_sketches
 
 
 
