@@ -15,27 +15,27 @@ import tensorflow as tf
 
 
 """
-Passos para construir o Transformer:
+Steps to build the Transformer:
 
-Criar funções auxiliares:
-    1- Criar função para aplicar o tokenizer
-    2- Criar função para criar camada de embedding
-    3- Criar funções para aplicar o positional encoding
-    4- Criar funções para calcular a atenção e seus pesos
+Auxiliary functions: #!DONE
+    1- Create function tokenize inputs
+    2- Create Embedding Layer
+    3- Create Positional Encoding Functions
+    4- Create attention functions 
 
-Criar classes:
-    1- Criar classe de multi-head attention para aplicar no encoder/decoder
-    2- Criar classe para um bloco de encoder
-    3- Criar classe para um bloco de decoder
-    4- Criar classe para um enconder completo (n blocos de encoder)
-    5- Criar classe para um decoder completo (n blocos de decoder)
-    6- Juntar tudo e construir o Transformer
+Classes: #!DONE
+    1- Create Multi-Head Attention Class
+    2- Create Encoder Layer class
+    3- Create Decoder Layer class
+    4- Create Encoder Block class (n encoder layers)
+    5- Create Decoder Block class (n decoder layers)
+    6- Put everything together and build the Transformer class
 
-Treinamento:
-    1- Criar função de loss e de acurácia
-    2- Definir rotina de treinamento
+Training: #!DONE
+    1- Create loss and accuaracy functions
+    2- Define training schedule
 
-Uso:
+Usage:
     1- Criar função para uso do Transformer como ferramenta de predição
     2- Criar funções de plotagem
 """
