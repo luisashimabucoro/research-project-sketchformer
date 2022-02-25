@@ -1,10 +1,13 @@
 """
 Credits to the Tensorflow Tutorial "Transformer model for language understanding"
 """
-
+import os
 import argparse
 import json
 import sys
+import time
+
+from sklearn import datasets
 sys.path.insert(0, '/store/lshimabucoro/projects/bumblebee/prep_data')
 sys.path.insert(0, '/store/lshimabucoro/projects/bumblebee/utils')
 import quickdraw_raw_to_tfrecords as dataloader
@@ -39,9 +42,15 @@ Usage:
     1- Criar função para uso do Transformer como ferramenta de predição
     2- Criar funções de plotagem
 """
+EPOCHS = 5
+BATCH_SIZE = 32
+TRAIN_BUFFER_SIZE = 7000*345*10
+TEST_BUFFER_SIZE = 345*2500
 
-BATCH_SIZE = 50
-BUFFER_SIZE = 345*2500
+# train_step_signature = [
+#     tf.TensorSpec(shape=(None, None), dtype=tf.int64),
+#     tf.TensorSpec(shape=(None, None), dtype=tf.int64),
+# ]
 
 # !LOAD AND TOKENIZE DATA 
 """
@@ -50,7 +59,7 @@ using the Grid Tokenizer based on the Stroke3 format. After it's all been mapped
 it is divided into batches n=BUFFER_SIZE/BATCH_SIZE batches of size BATCH_SIZE.
 """
 
-def tokenize_single(sketch, label, resolution=100, max_len=100):
+def tokenize_single(sketch, label, resolution=100, max_len=512):
     grid_tok = tokenizer.GridTokenizer(resolution, max_len)
     enconded_sketch = grid_tok.encode(sketch)
 
@@ -59,7 +68,7 @@ def tokenize_single(sketch, label, resolution=100, max_len=100):
 def create_batches(dataset):
     return(
         dataset
-        .shuffle(BUFFER_SIZE)
+        .shuffle(TRAIN_BUFFER_SIZE)
         .map(lambda *x : tf.py_function(func=tokenize_single, inp=[*x], Tout=[tf.int64, tf.int64]), num_parallel_calls=tf.data.AUTOTUNE)
         .batch(BATCH_SIZE)
     )
@@ -68,6 +77,28 @@ def create_batches(dataset):
     # batches = dataset.batch(BATCH_SIZE)
 
     # return batches
+
+def join_dataset_files(dataset_dir):
+    buffer = TEST_BUFFER_SIZE
+    datasets = {}
+
+    for split in ['train', 'valid', 'test']:
+        tfrecords_pattern = os.path.join(dataset_dir, "{}*.records".format(split))
+        files = tf.io.matching_files(tfrecords_pattern)
+        # print(files, '\n')
+        # shards = tf.data.Dataset.from_tensor_slices(files)
+        # print(shards)
+        dataset = dataloader.parse_dataset(files)
+        # print(dataset)
+        # dataset = shards.interleave(lambda d: dataloader.parse_dataset(files))
+        if split == 'train':
+            buffer =  TRAIN_BUFFER_SIZE
+        dataset = dataset.shuffle(buffer)
+        dataset = dataset.map(lambda *x : tf.py_function(func=tokenize_single, inp=[*x], Tout=[tf.int64, tf.int64]), num_parallel_calls=tf.data.AUTOTUNE)
+        batches = dataset.batch(BATCH_SIZE)
+        datasets[split] = batches
+
+    return datasets
 
 # !POSITIONAL ENCODING
 """
@@ -297,16 +328,20 @@ class DecoderLayer(tf.keras.layers.Layer):
         self.dropout2 = tf.keras.layers.Dropout(rate)
         self.dropout3 = tf.keras.layers.Dropout(rate)
 
+    # def call(self, x, enc_output, training,
+    #             look_ahead_mask, padding_mask):
     def call(self, x, enc_output, training,
-                look_ahead_mask, padding_mask):
+                look_ahead_mask):
         # enc_output.shape == (batch_size, input_seq_len, d_model)
 
         attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
         attn1 = self.dropout1(attn1, training=training)
         out1 = self.layernorm1(attn1 + x)
 
+        # attn2, attn_weights_block2 = self.mha2(
+        #     enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
         attn2, attn_weights_block2 = self.mha2(
-            enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
+            enc_output, enc_output, out1, None)  # (batch_size, target_seq_len, d_model)
         attn2 = self.dropout2(attn2, training=training)
         out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
 
@@ -392,7 +427,7 @@ class Decoder(tf.keras.layers.Layer):
 
         for i in range(self.num_layers):
             x, block1, block2 = self.dec_layers[i](x, enc_output, training,
-                                                    look_ahead_mask, padding_mask)
+                                                    look_ahead_mask)
 
             attention_weights[f'decoder_layer{i+1}_block1'] = block1
             attention_weights[f'decoder_layer{i+1}_block2'] = block2
@@ -456,6 +491,7 @@ class Transformer(tf.keras.Model):
 
 # ? ============================ TRAINING SCHEDULE ============================
 
+# The custom schedule defines the learning rate
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=4000):
         super(CustomSchedule, self).__init__()
@@ -497,7 +533,103 @@ def accuracy_function(real, pred):
 
 # ? ============================ TRAINING ============================
 
+def checkpoint_manager(transformer, optimizer):
+    checkpoint_path = "/store/lshimabucoro/projects/bumblebee/scratch/checkpoints/train/initial-sketch-transformer"
 
+    ckpt = tf.train.Checkpoint(transformer=transformer,
+                            optimizer=optimizer)
+
+    ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+
+    # if a checkpoint exists, restore the latest checkpoint.
+    if ckpt_manager.latest_checkpoint:
+        ckpt.restore(ckpt_manager.latest_checkpoint)
+        print('Latest checkpoint restored!!')
+    
+    return ckpt_manager
+
+class TrainingTransformer():
+    def __init__(self, transformer, optimizer, train_loss, train_accuracy):
+        self.transformer = transformer
+        self.optimizer = optimizer
+        self.train_loss = train_loss
+        self.train_accuracy = train_accuracy
+    
+    def __call__(self):
+        return self.transformer, self.optimizer, self.train_loss, self.train_accuracy
+
+# @tf.function(input_signature=train_step_signature)
+@tf.function
+def train_step(inp, tar, training_obj):
+    transformer, optimizer, train_loss, train_accuracy = training_obj()
+    tar_inp = tar[:, :-1]
+    tar_real = tar[:, 1:]
+
+    with tf.GradientTape() as tape:
+        predictions, _ = transformer([inp, tar_inp],
+                                    training = True)
+        loss = loss_function(tar_real, predictions)
+
+    gradients = tape.gradient(loss, transformer.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
+
+    train_loss(loss)
+    train_accuracy(accuracy_function(tar_real, predictions))
+
+def training_schedule(train_batches, training_obj, ckpt_manager):
+    _, _, train_loss, train_accuracy = training_obj()
+    for epoch in range(EPOCHS):
+        start = time.time()
+
+        train_loss.reset_states()
+        train_accuracy.reset_states()
+
+        for (batch, (img, label)) in enumerate(train_batches):
+            train_step(img, img, training_obj)
+
+            if batch % 50 == 0:
+                print(f'Epoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f}')
+                if batch % 10000 == 0:
+                    ckpt_save_path = ckpt_manager.save()
+                    print(f'\nSaving checkpoint for batch {batch} at {ckpt_save_path}\n')
+                    print(f'Time taken for 10000 batches: {time.time() - start:.2f} secs\n')
+            
+
+        ckpt_save_path = ckpt_manager.save()
+        print(f'Saving checkpoint for epoch {epoch+1} at {ckpt_save_path}')
+
+        print(f'Epoch {epoch + 1} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f}')
+
+        print(f'Time taken for 1 epoch: {time.time() - start:.2f} secs\n')
+
+# d_model = size of the word (depth of word)
+# dff = number of words
+def train_model(dataset, num_layers=4, d_model=128, dff=512, num_heads=8, dropout_rate=0.1, vocab_size=10004):
+    transformer = Transformer(
+    num_layers=num_layers,
+    d_model=d_model,
+    num_heads=num_heads,
+    dff=dff,
+    input_vocab_size=vocab_size,
+    target_vocab_size=vocab_size,
+    pe_input=1000,
+    pe_target=1000,
+    rate=dropout_rate)
+
+    learning_rate = CustomSchedule(d_model)
+    optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
+                                        epsilon=1e-9)
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
+
+    print(transformer)
+    ckp_mng = checkpoint_manager(transformer, optimizer)
+    training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
+
+    training_schedule(dataset, training_obj, ckp_mng)
+
+def validate_model(dataset):
+    return
 
 def main():
     parser = argparse.ArgumentParser(description="Initial sketch transformer - L. Shimabucoro")
@@ -510,14 +642,50 @@ def main():
     #     class_idx_dict = json.load(json_file)['idx_to_classes']
     #     print(class_idx_dict)
     
-    dataset = dataloader.parse_dataset('/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/valid000.records')
+    # dataset = dataloader.parse_dataset('/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/valid000.records')
 
-    batches = create_batches(dataset)
-    for batch in batches:
-        print(batch)
-        break
+    # batches = create_batches(dataset)
+    # for batch in batches:
+    #     print(batch)
+    #     break
 
+    # datasets = join_dataset_files(args.dataset_dir)
 
+    # for batch in datasets['train']:
+    #     print(batch)
+    #     break
+                                        
+    # num_layers = 4
+    # d_model = 128
+    # dff = 512
+    # num_heads = 8
+    # dropout_rate = 0.1
+
+    # transformer = Transformer(
+    # num_layers=num_layers,
+    # d_model=d_model,
+    # num_heads=num_heads,
+    # dff=dff,
+    # input_vocab_size=10004,
+    # target_vocab_size=10004,
+    # pe_input=1000,
+    # pe_target=1000,
+    # rate=dropout_rate)
+
+    # learning_rate = CustomSchedule(d_model)
+    # optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
+    #                                     epsilon=1e-9)
+    # train_loss = tf.keras.metrics.Mean(name='train_loss')
+    # train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
+
+    # print(transformer)
+    # ckp_mng = checkpoint_manager(transformer, optimizer)
+    # training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
+
+    # training_schedule(datasets['train'], training_obj, ckp_mng)
+
+    datasets = join_dataset_files(args.dataset_dir)
+    train_model(datasets['train'], num_layers=4, d_model=128, dff=512, num_heads=8, dropout_rate=0.1, vocab_size=10004)
 
 if __name__ == "__main__":
     main()
