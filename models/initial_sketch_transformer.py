@@ -43,7 +43,7 @@ Usage:
     2- Criar funções de plotagem
 """
 EPOCHS = 5
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 TRAIN_BUFFER_SIZE = 7000*345*10
 TEST_BUFFER_SIZE = 345*2500
 
@@ -58,44 +58,35 @@ The data here is loaded from the TFRecord files, shuffled and them tokenized
 using the Grid Tokenizer based on the Stroke3 format. After it's all been mapped
 it is divided into batches n=BUFFER_SIZE/BATCH_SIZE batches of size BATCH_SIZE.
 """
+def tokenize_single_tf(sketch, label, resolution=100, max_len=512):
+    grid_tok = tokenizer.GridTokenizer(resolution, max_len)
+    _, enconded_sketch = grid_tok.encode_tf(tf.cast(sketch, dtype=tf.int64), cls=False)
+
+    return enconded_sketch, label
 
 def tokenize_single(sketch, label, resolution=100, max_len=512):
     grid_tok = tokenizer.GridTokenizer(resolution, max_len)
-    enconded_sketch = grid_tok.encode(sketch)
+    _, enconded_sketch = grid_tok.encode(sketch)
 
-    return tf.convert_to_tensor(enconded_sketch[1]), label
-
-def create_batches(dataset):
-    return(
-        dataset
-        .shuffle(TRAIN_BUFFER_SIZE)
-        .map(lambda *x : tf.py_function(func=tokenize_single, inp=[*x], Tout=[tf.int64, tf.int64]), num_parallel_calls=tf.data.AUTOTUNE)
-        .batch(BATCH_SIZE)
-    )
-    # dataset = dataset.shuffle(BUFFER_SIZE)
-    # dataset = dataset.map(lambda *x : tf.py_function(func=tokenize_single, inp=[*x], Tout=[tf.int64, tf.int64]))
-    # batches = dataset.batch(BATCH_SIZE)
-
-    # return batches
+    return tf.convert_to_tensor(enconded_sketch), label
 
 def join_dataset_files(dataset_dir):
-    buffer = TEST_BUFFER_SIZE
+    buffer = TRAIN_BUFFER_SIZE
     datasets = {}
 
     for split in ['train', 'valid', 'test']:
         tfrecords_pattern = os.path.join(dataset_dir, "{}*.records".format(split))
         files = tf.io.matching_files(tfrecords_pattern)
-        # print(files, '\n')
-        # shards = tf.data.Dataset.from_tensor_slices(files)
-        # print(shards)
+
         dataset = dataloader.parse_dataset(files)
-        # print(dataset)
-        # dataset = shards.interleave(lambda d: dataloader.parse_dataset(files))
-        if split == 'train':
-            buffer =  TRAIN_BUFFER_SIZE
-        dataset = dataset.shuffle(buffer)
-        dataset = dataset.map(lambda *x : tf.py_function(func=tokenize_single, inp=[*x], Tout=[tf.int64, tf.int64]), num_parallel_calls=tf.data.AUTOTUNE)
-        batches = dataset.batch(BATCH_SIZE)
+        if split != 'train':
+            buffer =  TEST_BUFFER_SIZE
+
+        # dataset = dataset.shuffle(buffer)
+        # dataset = dataset.map(tokenize_single_tf)
+        batches = dataset.padded_batch(BATCH_SIZE)
+        # batches = dataset.batch(BATCH_SIZE)
+
         datasets[split] = batches
 
     return datasets
@@ -108,15 +99,15 @@ gives context about the word itself, and not its relationship with neighbouring 
 
 The formula is the one used in the original paper, which consists of sin/cos transformations.
 """
-def get_angles(pos, i, d_model):
-    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+def get_angles(pos, i, point_size):
+    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(point_size))
     return pos * angle_rates
 
-# position of the word in the sentence and d_model = size of the word
-def positional_encoding(position, d_model):
+# position of the word in the sentence and point_size = size of the word
+def positional_encoding(position, point_size):
     angle_rads = get_angles(np.arange(position)[:, np.newaxis],
-                            np.arange(d_model)[np.newaxis, :],
-                            d_model)
+                            np.arange(point_size)[np.newaxis, :],
+                            point_size)
 
     # apply sin to even indices in the array; 2i
     angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
@@ -213,23 +204,24 @@ from each other, which increases the representation subspace.
 
 class MultiHeadAttention(tf.keras.layers.Layer):
 
-  def __init__(self, d_model, num_heads):
+  def __init__(self, point_size, num_heads):
     super(MultiHeadAttention, self).__init__()
     self.num_heads = num_heads
-    self.d_model = d_model
+    self.point_size = point_size
 
-    assert d_model % self.num_heads == 0
+    assert point_size % self.num_heads == 0
 
-    self.depth = d_model // self.num_heads
+    self.depth = point_size // self.num_heads
 
-    self.wq = tf.keras.layers.Dense(d_model)
-    self.wk = tf.keras.layers.Dense(d_model)
-    self.wv = tf.keras.layers.Dense(d_model)
+    self.wq = tf.keras.layers.Dense(point_size)
+    self.wk = tf.keras.layers.Dense(point_size)
+    self.wv = tf.keras.layers.Dense(point_size)
 
-    self.dense = tf.keras.layers.Dense(d_model)
+    self.dense = tf.keras.layers.Dense(point_size)
 
   def split_heads(self, x, batch_size):
-    """Split the last dimension into (num_heads, depth).
+    """
+    Split the last dimension into (num_heads, depth).
     Transpose the result such that the shape is (batch_size, num_heads, seq_len, depth)
     """
     x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
@@ -239,9 +231,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     batch_size = tf.shape(q)[0]
 
     # Here we multiply out inputs by the Q, K and V weight matrices so as to obtain Q, K, and V themselves  
-    q = self.wq(q)  # (batch_size, seq_len, d_model)
-    k = self.wk(k)  # (batch_size, seq_len, d_model)
-    v = self.wv(v)  # (batch_size, seq_len, d_model)
+    q = self.wq(q)  # (batch_size, seq_len, point_size)
+    k = self.wk(k)  # (batch_size, seq_len, point_size)
+    v = self.wv(v)  # (batch_size, seq_len, point_size)
 
     q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
     k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
@@ -255,9 +247,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])  # (batch_size, seq_len_q, num_heads, depth)
 
     concat_attention = tf.reshape(scaled_attention,
-                                  (batch_size, -1, self.d_model))  # (batch_size, seq_len_q, d_model)
+                                  (batch_size, -1, self.point_size))  # (batch_size, seq_len_q, point_size)
 
-    output = self.dense(concat_attention)  # (batch_size, seq_len_q, d_model)
+    output = self.dense(concat_attention)  # (batch_size, seq_len_q, point_size)
 
     return output, attention_weights
 
@@ -267,10 +259,10 @@ Here we have the feed-foward block responsible for processing the selected infor
 given by the attention block.
 """
 
-def point_wise_feed_forward_network(d_model, dff):
+def point_wise_feed_forward_network(point_size, n_points):
   return tf.keras.Sequential([
-      tf.keras.layers.Dense(dff, activation='relu'),  # (batch_size, seq_len, dff)
-      tf.keras.layers.Dense(d_model)  # (batch_size, seq_len, d_model)
+      tf.keras.layers.Dense(n_points, activation='relu'),  # (batch_size, seq_len, n_points)
+      tf.keras.layers.Dense(point_size)  # (batch_size, seq_len, point_size)
   ])
 
 # ? ============================ ENCODER AND DECODER LAYERS ============================
@@ -281,11 +273,11 @@ gradient issues.
 """
 
 class EncoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
+    def __init__(self, point_size, num_heads, n_points, rate=0.1):
         super(EncoderLayer, self).__init__()
 
-        self.multi_head_attention = MultiHeadAttention(d_model, num_heads)
-        self.feed_foward_nn = point_wise_feed_forward_network(d_model, dff)
+        self.multi_head_attention = MultiHeadAttention(point_size, num_heads)
+        self.feed_foward_nn = point_wise_feed_forward_network(point_size, n_points)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -295,13 +287,13 @@ class EncoderLayer(tf.keras.layers.Layer):
 
     def call(self, x, training, mask):
 
-        attention_output, _ = self.multi_head_attention(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
+        attention_output, _ = self.multi_head_attention(x, x, x, mask)  # (batch_size, input_seq_len, point_size)
         attention_output = self.dropout1(attention_output, training=training)
-        out1 = self.layernorm1(x + attention_output)  # (batch_size, input_seq_len, d_model)
+        out1 = self.layernorm1(x + attention_output)  # (batch_size, input_seq_len, point_size)
 
-        feed_foward_nn_output = self.feed_foward_nn(out1)  # (batch_size, input_seq_len, d_model)
+        feed_foward_nn_output = self.feed_foward_nn(out1)  # (batch_size, input_seq_len, point_size)
         feed_foward_nn_output = self.dropout2(feed_foward_nn_output, training=training)
-        out2 = self.layernorm2(out1 + feed_foward_nn_output)  # (batch_size, input_seq_len, d_model)
+        out2 = self.layernorm2(out1 + feed_foward_nn_output)  # (batch_size, input_seq_len, point_size)
 
         return out2
 
@@ -312,13 +304,13 @@ encoder-decoder attention (input-output), followed by a Feed Foward NN, to which
 Normalization Layers and Dropout in order to avoid overfitting and gradient issues.
 """
 class DecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
+    def __init__(self, point_size, num_heads, n_points, rate=0.1):
         super(DecoderLayer, self).__init__()
 
-        self.mha1 = MultiHeadAttention(d_model, num_heads)
-        self.mha2 = MultiHeadAttention(d_model, num_heads)
+        self.mha1 = MultiHeadAttention(point_size, num_heads)
+        self.mha2 = MultiHeadAttention(point_size, num_heads)
 
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
+        self.ffn = point_wise_feed_forward_network(point_size, n_points)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -332,22 +324,22 @@ class DecoderLayer(tf.keras.layers.Layer):
     #             look_ahead_mask, padding_mask):
     def call(self, x, enc_output, training,
                 look_ahead_mask):
-        # enc_output.shape == (batch_size, input_seq_len, d_model)
+        # enc_output.shape == (batch_size, input_seq_len, point_size)
 
-        attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
+        attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, point_size)
         attn1 = self.dropout1(attn1, training=training)
         out1 = self.layernorm1(attn1 + x)
 
         # attn2, attn_weights_block2 = self.mha2(
-        #     enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
+        #     enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, point_size)
         attn2, attn_weights_block2 = self.mha2(
-            enc_output, enc_output, out1, None)  # (batch_size, target_seq_len, d_model)
+            enc_output, enc_output, out1, None)  # (batch_size, target_seq_len, point_size)
         attn2 = self.dropout2(attn2, training=training)
-        out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
+        out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, point_size)
 
-        ffn_output = self.ffn(out2)  # (batch_size, target_seq_len, d_model)
+        ffn_output = self.ffn(out2)  # (batch_size, target_seq_len, point_size)
         ffn_output = self.dropout3(ffn_output, training=training)
-        out3 = self.layernorm3(ffn_output + out2)  # (batch_size, target_seq_len, d_model)
+        out3 = self.layernorm3(ffn_output + out2)  # (batch_size, target_seq_len, point_size)
 
         return out3, attn_weights_block1, attn_weights_block2
 
@@ -358,37 +350,43 @@ Layer and n Encoder Layers. It's a wrap-up of the entire Encoder.
 """
 
 class Encoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
+    def __init__(self, num_layers, point_size, num_heads, n_points, input_vocab_size,
                 maximum_position_encoding, rate=0.1):
         super(Encoder, self).__init__()
 
-        self.d_model = d_model
+        self.point_size = point_size
         self.num_layers = num_layers
 
-        self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
+        self.embedding = tf.keras.layers.Embedding(input_vocab_size, point_size)
         self.pos_encoding = positional_encoding(maximum_position_encoding,
-                                                self.d_model)
+                                                self.point_size)
 
-        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate)
+        self.enc_layers = [EncoderLayer(point_size, num_heads, n_points, rate)
                             for _ in range(num_layers)]
 
         self.dropout = tf.keras.layers.Dropout(rate)
+        # self.classifier_dense_layer = tf.keras.layers.Dense(345, input_shape=(point_size,))
 
     def call(self, x, training, mask):
 
         seq_len = tf.shape(x)[1]
 
         # adding embedding and position encoding.
-        x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x = self.embedding(x)  # (batch_size, input_seq_len, point_size)
+        x *= tf.math.sqrt(tf.cast(self.point_size, tf.float32))
         x += self.pos_encoding[:, :seq_len, :]
 
         x = self.dropout(x, training=training)
 
         for i in range(self.num_layers):
             x = self.enc_layers[i](x, training, mask)
+        
+        # classification_logits = self.classifier_dense_layer(x[:, 0, :])
+        # 
+        # print(tf.shape(classification_logits))
+        # tf.nn.softmax(classification_logits)
 
-        return x  # (batch_size, input_seq_len, d_model)
+        return x  # (batch_size, input_seq_len, point_size)
 
 """
 The Decoder Block is formed by a Embedding Layer, followed by the Positional Encoding
@@ -396,17 +394,17 @@ Layer and n Decoder Layers. It's a wrap-up of the entire Decoder.
 """
 
 class Decoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, target_vocab_size,
+    def __init__(self, num_layers, point_size, num_heads, n_points, target_vocab_size,
                     maximum_position_encoding, rate=0.1):
         super(Decoder, self).__init__()
 
-        self.d_model = d_model
+        self.point_size = point_size
         self.num_layers = num_layers
 
-        self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
+        self.embedding = tf.keras.layers.Embedding(target_vocab_size, point_size)
+        self.pos_encoding = positional_encoding(maximum_position_encoding, point_size)
 
-        self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate)
+        self.dec_layers = [DecoderLayer(point_size, num_heads, n_points, rate)
                             for _ in range(num_layers)]
         self.dropout = tf.keras.layers.Dropout(rate)
 
@@ -419,8 +417,8 @@ class Decoder(tf.keras.layers.Layer):
         seq_len = tf.shape(x)[1]
         attention_weights = {}
 
-        x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x = self.embedding(x)  # (batch_size, target_seq_len, point_size)
+        x *= tf.math.sqrt(tf.cast(self.point_size, tf.float32))
         x += self.pos_encoding[:, :seq_len, :]
 
         x = self.dropout(x, training=training)
@@ -432,7 +430,7 @@ class Decoder(tf.keras.layers.Layer):
             attention_weights[f'decoder_layer{i+1}_block1'] = block1
             attention_weights[f'decoder_layer{i+1}_block2'] = block2
 
-        # x.shape == (batch_size, target_seq_len, d_model)
+        # x.shape == (batch_size, target_seq_len, point_size)
         return x, attention_weights
 
 # ? ============================ TRANSFORMER ============================
@@ -443,13 +441,13 @@ giving our model outputs.
 """
 
 class Transformer(tf.keras.Model):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size,
+    def __init__(self, num_layers, point_size, num_heads, n_points, input_vocab_size,
                     target_vocab_size, pe_input, pe_target, rate=0.1):
         super().__init__()
-        self.encoder = Encoder(num_layers, d_model, num_heads, dff,
+        self.encoder = Encoder(num_layers, point_size, num_heads, n_points,
                                     input_vocab_size, pe_input, rate)
 
-        self.decoder = Decoder(num_layers, d_model, num_heads, dff,
+        self.decoder = Decoder(num_layers, point_size, num_heads, n_points,
                                 target_vocab_size, pe_target, rate)
 
         self.final_layer = tf.keras.layers.Dense(target_vocab_size)
@@ -457,13 +455,15 @@ class Transformer(tf.keras.Model):
     def call(self, inputs, training):
         # Keras models prefer if you pass all your inputs in the first argument
         inp, tar = inputs
+        # tf.print(inp, tar)
 
         # enc_padding_mask, look_ahead_mask, dec_padding_mask = self.create_masks(inp, tar)
+        # print(f"Inp: {inp} \n Tar: {tar}")
         enc_padding_mask, look_ahead_mask = self.create_masks(inp, tar)
 
-        enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, d_model)
+        enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, point_size)
 
-        # dec_output.shape == (batch_size, tar_seq_len, d_model)
+        # dec_output.shape == (batch_size, tar_seq_len, point_size)
         # dec_output, attention_weights = self.decoder(
         #     tar, enc_output, training, look_ahead_mask, dec_padding_mask)
         dec_output, attention_weights = self.decoder(tar, enc_output, training, look_ahead_mask)
@@ -493,11 +493,11 @@ class Transformer(tf.keras.Model):
 
 # The custom schedule defines the learning rate
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, d_model, warmup_steps=4000):
+    def __init__(self, point_size, warmup_steps=4000):
         super(CustomSchedule, self).__init__()
 
-        self.d_model = d_model
-        self.d_model = tf.cast(self.d_model, tf.float32)
+        self.point_size = point_size
+        self.point_size = tf.cast(self.point_size, tf.float32)
 
         self.warmup_steps = warmup_steps
 
@@ -505,7 +505,7 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
         arg1 = tf.math.rsqrt(step)
         arg2 = step * (self.warmup_steps ** -1.5)
 
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+        return tf.math.rsqrt(self.point_size) * tf.math.minimum(arg1, arg2)
 
 # ? ============================ LOSS AND METRICS ============================
 # The loss function used is the Sparse Categorical Crossentropy
@@ -533,7 +533,7 @@ def accuracy_function(real, pred):
 
 # ? ============================ TRAINING ============================
 
-def checkpoint_manager(transformer, optimizer):
+def checkpoint_manager(transformer, optimizer, restore=True):
     checkpoint_path = "/store/lshimabucoro/projects/bumblebee/scratch/checkpoints/train/initial-sketch-transformer"
 
     ckpt = tf.train.Checkpoint(transformer=transformer,
@@ -542,9 +542,9 @@ def checkpoint_manager(transformer, optimizer):
     ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
 
     # if a checkpoint exists, restore the latest checkpoint.
-    if ckpt_manager.latest_checkpoint:
+    if restore and ckpt_manager.latest_checkpoint:
         ckpt.restore(ckpt_manager.latest_checkpoint)
-        print('Latest checkpoint restored!!')
+        print('\nLatest checkpoint restored!!\n')
     
     return ckpt_manager
 
@@ -580,19 +580,23 @@ def training_schedule(train_batches, training_obj, ckpt_manager):
     _, _, train_loss, train_accuracy = training_obj()
     for epoch in range(EPOCHS):
         start = time.time()
+        latest_time = start
 
         train_loss.reset_states()
         train_accuracy.reset_states()
 
         for (batch, (img, label)) in enumerate(train_batches):
             train_step(img, img, training_obj)
-
+            cur_time = time.time()
+            # print(f'Time taken for 1 batch: {cur_time - latest_time:.2f} secs\n')
             if batch % 50 == 0:
                 print(f'Epoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f}')
-                if batch % 10000 == 0:
+                if batch % 5000 == 0 and batch != 0:
                     ckpt_save_path = ckpt_manager.save()
                     print(f'\nSaving checkpoint for batch {batch} at {ckpt_save_path}\n')
                     print(f'Time taken for 10000 batches: {time.time() - start:.2f} secs\n')
+            
+            latest_time = cur_time
             
 
         ckpt_save_path = ckpt_manager.save()
@@ -604,88 +608,179 @@ def training_schedule(train_batches, training_obj, ckpt_manager):
 
 # d_model = size of the word (depth of word)
 # dff = number of words
-def train_model(dataset, num_layers=4, d_model=128, dff=512, num_heads=8, dropout_rate=0.1, vocab_size=10004):
+# pe_input/pe_target are related to the positional encoding
+def train_model(dataset, num_layers=6, point_size=128, n_points=512, num_heads=8, dropout_rate=0.1, vocab_size=10004):
     transformer = Transformer(
     num_layers=num_layers,
-    d_model=d_model,
+    point_size=point_size,
     num_heads=num_heads,
-    dff=dff,
+    n_points=n_points,
     input_vocab_size=vocab_size,
     target_vocab_size=vocab_size,
     pe_input=1000,
     pe_target=1000,
     rate=dropout_rate)
 
-    learning_rate = CustomSchedule(d_model)
-    optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
-                                        epsilon=1e-9)
+    learning_rate = CustomSchedule(point_size)
+    optimizer = tf.keras.optimizers.Adam(learning_rate)
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
 
     print(transformer)
-    ckp_mng = checkpoint_manager(transformer, optimizer)
+    ckp_mng = checkpoint_manager(transformer, optimizer, restore=False)
     training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
 
     training_schedule(dataset, training_obj, ckp_mng)
 
-def validate_model(dataset):
+def validate_single_batch(input, target, transformer):
+    tar_inp = target[:, :-1]
+    tar_real = target[:, 1:]
+
+    predictions, _ = transformer([input, tar_inp], training=False)
+    loss = loss_function(tar_real, predictions)
+    accuracy = accuracy_function(tar_real, predictions)
+
+    return loss, accuracy 
+
+def validate_model(valid_batches, transformer, optimizer):
+    ckpt_mng = checkpoint_manager(transformer, optimizer, restore=True)
+    valid_loss = tf.keras.metrics.Mean(name='validation_loss')
+    valid_accuracy = tf.keras.metrics.Mean(name='validation_accuracy')
+
+    valid_loss.reset_states()
+    valid_accuracy.reset_states()
+
+    for (batch, (img, label)) in enumerate(valid_batches):
+        loss, acc = validate_single_batch(img, img)
+        print(f"Batch {batch} - loss {loss:.4f} and accuracy {acc:.4f}")
+
     return
+
+class Translator(tf.Module):
+    def __init__(self, sketch_tokenizer, transformer):
+        self.sketch_tokenizer = sketch_tokenizer
+        self.transformer = transformer
+
+    def __call__(self, sketch, max_length=512):
+        assert isinstance(sketch, tf.Tensor)
+        if len(sketch.shape) == 0:
+            sketch = sketch[tf.newaxis]
+
+        # stroke3
+        scale, sketch = self.sketch_tokenizer.encode_tf(sketch)
+
+        encoder_input = sketch[tf.newaxis, :]
+        print(encoder_input)
+
+        start_end = tf.constant(value=[10002, 10003])
+        start = start_end[0][tf.newaxis]
+        end = start_end[1][tf.newaxis]
+
+        output_array = tf.TensorArray(dtype=tf.int64, size=0, dynamic_size=True)
+        output_array = output_array.write(index=0, value=tf.cast(start, dtype=tf.int64))
+        print(output_array)
+
+        for i in tf.range(max_length):
+            output = tf.transpose(output_array.stack())
+            predictions, _ = self.transformer([encoder_input, output], training=False)
+
+            # select the last token from the seq_len dimension
+            predictions = predictions[:, -1:, :]  # (batch_size, 1, vocab_size)
+
+            predicted_id = tf.argmax(predictions, axis=-1)
+
+            # concatentate the predicted_id to the output which is given to the decoder
+            # as its input.
+            output_array = output_array.write(i+1, tf.cast(predicted_id[0], dtype=tf.int64))
+            if tf.cast(predicted_id, dtype=tf.int64) == tf.cast(end, dtype=tf.int64):
+                break
+
+        output = tf.transpose(output_array.stack())
+        print(tf.squeeze(output))
+        stroke3_sketch = self.sketch_tokenizer.decode_single(tf.squeeze(output), scale)  # shape: ()
+        print(stroke3_sketch)
+        tokenizer.stroke3_to_image(stroke3_sketch, scale, file_name="reconstruction.png")
+
+        # tokens = sketch_tokenizer.en.lookup(output)[0]
+
+        # `tf.function` prevents us from using the attention_weights that were
+        # calculated on the last iteration of the loop. So recalculate them outside
+        # the loop.
+        _, attention_weights = self.transformer([encoder_input, output[:,:-1]], training=False)
+
+        return stroke3_sketch, attention_weights
+
+# def checkpoint_manager(transformer, optimizer):
+#     checkpoint_path = "/store/lshimabucoro/projects/bumblebee/scratch/checkpoints/train/initial-sketch-transformer"
+
+#     ckpt = tf.train.Checkpoint(transformer=transformer,
+#                             optimizer=optimizer)
+
+#     ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+
+#     # if a checkpoint exists, restore the latest checkpoint.
+#     if ckpt_manager.latest_checkpoint:
+#         ckpt.restore(ckpt_manager.latest_checkpoint)
+#         print('\nLatest checkpoint restored!!\n')
+    
+#     return ckpt_manager
 
 def main():
     parser = argparse.ArgumentParser(description="Initial sketch transformer - L. Shimabucoro")
     parser.add_argument('--dataset-dir', type=str, default='/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345')
     parser.add_argument('--class-index-dict', type=str, default='/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/meta.json')
     args = parser.parse_args()
-
-
-    # with open(args.class_index_dict, 'r') as json_file:
-    #     class_idx_dict = json.load(json_file)['idx_to_classes']
-    #     print(class_idx_dict)
-    
-    # dataset = dataloader.parse_dataset('/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/valid000.records')
-
-    # batches = create_batches(dataset)
-    # for batch in batches:
-    #     print(batch)
-    #     break
-
-    # datasets = join_dataset_files(args.dataset_dir)
-
-    # for batch in datasets['train']:
-    #     print(batch)
-    #     break
                                         
-    # num_layers = 4
-    # d_model = 128
-    # dff = 512
-    # num_heads = 8
-    # dropout_rate = 0.1
+    num_layers = 6
+    point_size = 128
+    n_points = 512
+    num_heads = 8
+    dropout_rate = 0.1
 
-    # transformer = Transformer(
-    # num_layers=num_layers,
-    # d_model=d_model,
-    # num_heads=num_heads,
-    # dff=dff,
-    # input_vocab_size=10004,
-    # target_vocab_size=10004,
-    # pe_input=1000,
-    # pe_target=1000,
-    # rate=dropout_rate)
+    transformer = Transformer(
+    num_layers=num_layers,
+    point_size=point_size,
+    num_heads=num_heads,
+    n_points=n_points,
+    input_vocab_size=10004,
+    target_vocab_size=10004,
+    pe_input=1000,
+    pe_target=1000,
+    rate=dropout_rate)
 
-    # learning_rate = CustomSchedule(d_model)
-    # optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
-    #                                     epsilon=1e-9)
+    learning_rate = CustomSchedule(point_size)
+    optimizer = tf.keras.optimizers.Adam(learning_rate)
     # train_loss = tf.keras.metrics.Mean(name='train_loss')
     # train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
 
     # print(transformer)
-    # ckp_mng = checkpoint_manager(transformer, optimizer)
+    ckp_mng = checkpoint_manager(transformer, optimizer, restore=True)
     # training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
 
     # training_schedule(datasets['train'], training_obj, ckp_mng)
 
     datasets = join_dataset_files(args.dataset_dir)
-    train_model(datasets['train'], num_layers=4, d_model=128, dff=512, num_heads=8, dropout_rate=0.1, vocab_size=10004)
+
+
+
+
+    # train_model(datasets['train'], num_layers=6, point_size=128, n_points=512, num_heads=8, dropout_rate=0.1, vocab_size=10004)
+    # validate_model(datasets['valid'], transformer, optimizer)
+
+    translator = Translator(tokenizer.GridTokenizer(100, 512), transformer)
+    
+    for batch in datasets['test']:
+        print(batch[0][5])
+        print(batch[1])
+        translator(batch[0][5])
+        break
+    # translator(example)
+    # for sketch, label in datasets['test']:
+    #     print(sketch)
+    #     for img in sketch:
+    #         print(img)
+    #         translator(img)
+    #         break
 
 if __name__ == "__main__":
     main()

@@ -145,6 +145,7 @@ def parse_dataset(filename):
     raw_dataset = tf.data.TFRecordDataset(filename, compression_type='GZIP')
 
     parsed_dataset = raw_dataset.map(parse_quickdraw_image)
+    # print(tf.data.experimental.cardinality(parsed_dataset))
 
     return parsed_dataset
 
