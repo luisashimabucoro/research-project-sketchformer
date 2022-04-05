@@ -47,10 +47,17 @@ BATCH_SIZE = 64
 TRAIN_BUFFER_SIZE = 7000*345*10
 TEST_BUFFER_SIZE = 345*2500
 
-# train_step_signature = [
-#     tf.TensorSpec(shape=(None, None), dtype=tf.int64),
-#     tf.TensorSpec(shape=(None, None), dtype=tf.int64),
-# ]
+def setup_gpu(gpu_ids):
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            sel_gpus = [gpus[g] for g in gpu_ids]
+            tf.config.set_visible_devices(sel_gpus, 'GPU')
+            for g in sel_gpus:
+                tf.config.experimental.set_memory_growth(g, True)
+        except RuntimeError as e:
+            # visible devices must be set before GPUs have been initialized
+            print(e)
 
 # !LOAD AND TOKENIZE DATA 
 """
@@ -60,7 +67,7 @@ it is divided into batches n=BUFFER_SIZE/BATCH_SIZE batches of size BATCH_SIZE.
 """
 def tokenize_single_tf(sketch, label, resolution=100, max_len=512):
     grid_tok = tokenizer.GridTokenizer(resolution, max_len)
-    _, enconded_sketch = grid_tok.encode_tf(tf.cast(sketch, dtype=tf.int64), cls=False)
+    _, enconded_sketch = grid_tok.encode_tf(tf.cast(sketch, dtype=tf.int64), cls=True)
 
     return enconded_sketch, label
 
@@ -82,10 +89,10 @@ def join_dataset_files(dataset_dir):
         if split != 'train':
             buffer =  TEST_BUFFER_SIZE
 
-        # dataset = dataset.shuffle(buffer)
-        # dataset = dataset.map(tokenize_single_tf)
-        batches = dataset.padded_batch(BATCH_SIZE)
-        # batches = dataset.batch(BATCH_SIZE)
+        dataset = dataset.shuffle(buffer)
+        dataset = dataset.map(tokenize_single_tf)
+        batches = dataset.batch(BATCH_SIZE)
+        # batches = dataset.padded_batch(BATCH_SIZE)
 
         datasets[split] = batches
 
@@ -365,7 +372,8 @@ class Encoder(tf.keras.layers.Layer):
                             for _ in range(num_layers)]
 
         self.dropout = tf.keras.layers.Dropout(rate)
-        # self.classifier_dense_layer = tf.keras.layers.Dense(345, input_shape=(point_size,))
+
+        self.classifier_dense_layer = tf.keras.layers.Dense(345)
 
     def call(self, x, training, mask):
 
@@ -379,14 +387,14 @@ class Encoder(tf.keras.layers.Layer):
         x = self.dropout(x, training=training)
 
         for i in range(self.num_layers):
-            x = self.enc_layers[i](x, training, mask)
+            x = self.enc_layers[i](x, training, mask)   # (batch_size, input_seq_len, point_size)
         
-        # classification_logits = self.classifier_dense_layer(x[:, 0, :])
-        # 
-        # print(tf.shape(classification_logits))
-        # tf.nn.softmax(classification_logits)
+        # transformar em one-hot as labels e passar pra ce (64, 365)
+        # (batch_size, n_classes)
+        classification_logits = self.classifier_dense_layer(x[:, 0, :])     # the input is only the first element of the encoder output [all_batches:first_element_only:point_size]
+        class_pred = tf.nn.softmax(classification_logits)    # (batch_size, point_size)
 
-        return x  # (batch_size, input_seq_len, point_size)
+        return x, class_pred  
 
 """
 The Decoder Block is formed by a Embedding Layer, followed by the Positional Encoding
@@ -454,14 +462,14 @@ class Transformer(tf.keras.Model):
 
     def call(self, inputs, training):
         # Keras models prefer if you pass all your inputs in the first argument
-        inp, tar = inputs
+        inp, tar, label = inputs
         # tf.print(inp, tar)
 
         # enc_padding_mask, look_ahead_mask, dec_padding_mask = self.create_masks(inp, tar)
         # print(f"Inp: {inp} \n Tar: {tar}")
         enc_padding_mask, look_ahead_mask = self.create_masks(inp, tar)
 
-        enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, point_size)
+        enc_output, class_pred = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, point_size)
 
         # dec_output.shape == (batch_size, tar_seq_len, point_size)
         # dec_output, attention_weights = self.decoder(
@@ -470,7 +478,7 @@ class Transformer(tf.keras.Model):
 
         final_output = self.final_layer(dec_output)  # (batch_size, tar_seq_len, target_vocab_size)
 
-        return final_output, attention_weights
+        return final_output, attention_weights, class_pred
 
     def create_masks(self, inp, tar):
         # Encoder padding mask
@@ -509,7 +517,7 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
 
 # ? ============================ LOSS AND METRICS ============================
 # The loss function used is the Sparse Categorical Crossentropy
-def loss_function(real, pred):
+def loss_function(real, pred, real_class, pred_class):
     loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True, reduction='none')
     mask = tf.math.logical_not(tf.math.equal(real, 0))
@@ -518,11 +526,25 @@ def loss_function(real, pred):
     mask = tf.cast(mask, dtype=loss_.dtype)
     loss_ *= mask
 
-    return tf.reduce_sum(loss_)/tf.reduce_sum(mask)
+    original_task_loss = tf.reduce_sum(loss_)/tf.reduce_sum(mask)
+    class_loss = class_loss_function(real_class, pred_class)
+
+    return original_task_loss + class_loss
+
+def class_loss_function(label_class, pred_class):
+    cross_entropy_loss = tf.keras.losses.CategoricalCrossentropy()
+    label_one_hot = tf.one_hot(label_class, depth=345)    # (batch_size, point_size)
+
+    class_loss = cross_entropy_loss(label_one_hot, pred_class)
+
+    return class_loss
 
 # Here we use the standard accuracy
-def accuracy_function(real, pred):
-    accuracies = tf.equal(real, tf.argmax(pred, axis=2))
+def accuracy_function(real, pred, classification=False):
+    axis = 2
+    if classification:
+        axis = 1
+    accuracies = tf.equal(real, tf.argmax(pred, axis=axis))
 
     mask = tf.math.logical_not(tf.math.equal(real, 0))
     accuracies = tf.math.logical_and(mask, accuracies)
@@ -533,8 +555,7 @@ def accuracy_function(real, pred):
 
 # ? ============================ TRAINING ============================
 
-def checkpoint_manager(transformer, optimizer, restore=True):
-    checkpoint_path = "/store/lshimabucoro/projects/bumblebee/scratch/checkpoints/train/initial-sketch-transformer"
+def checkpoint_manager(transformer, optimizer, checkpoint_path, restore=True):
 
     ckpt = tf.train.Checkpoint(transformer=transformer,
                             optimizer=optimizer)
@@ -549,54 +570,54 @@ def checkpoint_manager(transformer, optimizer, restore=True):
     return ckpt_manager
 
 class TrainingTransformer():
-    def __init__(self, transformer, optimizer, train_loss, train_accuracy):
+    def __init__(self, transformer, optimizer, train_loss, train_accuracy, class_accuracy):
         self.transformer = transformer
         self.optimizer = optimizer
         self.train_loss = train_loss
         self.train_accuracy = train_accuracy
+        self.class_accuracy = class_accuracy
     
     def __call__(self):
-        return self.transformer, self.optimizer, self.train_loss, self.train_accuracy
+        return self.transformer, self.optimizer, self.train_loss, self.train_accuracy, self.class_accuracy
 
 # @tf.function(input_signature=train_step_signature)
 @tf.function
-def train_step(inp, tar, training_obj):
-    transformer, optimizer, train_loss, train_accuracy = training_obj()
+def train_step(inp, tar, label, training_obj):
+    transformer, optimizer, train_loss, train_accuracy, class_accuracy = training_obj()
     tar_inp = tar[:, :-1]
     tar_real = tar[:, 1:]
 
     with tf.GradientTape() as tape:
-        predictions, _ = transformer([inp, tar_inp],
+        predictions, _, class_pred = transformer([inp, tar_inp, label],
                                     training = True)
-        loss = loss_function(tar_real, predictions)
+        loss = loss_function(tar_real, predictions, label, class_pred)
 
     gradients = tape.gradient(loss, transformer.trainable_variables)
     optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
 
     train_loss(loss)
     train_accuracy(accuracy_function(tar_real, predictions))
+    class_accuracy(accuracy_function(label, class_pred, classification=True))
 
 def training_schedule(train_batches, training_obj, ckpt_manager):
-    _, _, train_loss, train_accuracy = training_obj()
+    _, _, train_loss, train_accuracy, class_accuracy = training_obj()
     for epoch in range(EPOCHS):
         start = time.time()
-        latest_time = start
 
         train_loss.reset_states()
         train_accuracy.reset_states()
+        class_accuracy.reset_states()
 
         for (batch, (img, label)) in enumerate(train_batches):
-            train_step(img, img, training_obj)
-            cur_time = time.time()
-            # print(f'Time taken for 1 batch: {cur_time - latest_time:.2f} secs\n')
+            train_step(img, img, label, training_obj)
+
             if batch % 50 == 0:
-                print(f'Epoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f}')
+                print(f'Epoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} Accuracy {train_accuracy.result():.4f} Classification Accuracy {class_accuracy.result():.4f}')
+                
                 if batch % 5000 == 0 and batch != 0:
                     ckpt_save_path = ckpt_manager.save()
                     print(f'\nSaving checkpoint for batch {batch} at {ckpt_save_path}\n')
-                    print(f'Time taken for 10000 batches: {time.time() - start:.2f} secs\n')
-            
-            latest_time = cur_time
+                    print(f'Time taken for {batch} batches: {time.time() - start:.2f} secs\n')
             
 
         ckpt_save_path = ckpt_manager.save()
@@ -606,9 +627,7 @@ def training_schedule(train_batches, training_obj, ckpt_manager):
 
         print(f'Time taken for 1 epoch: {time.time() - start:.2f} secs\n')
 
-# d_model = size of the word (depth of word)
-# dff = number of words
-# pe_input/pe_target are related to the positional encoding
+
 def train_model(dataset, num_layers=6, point_size=128, n_points=512, num_heads=8, dropout_rate=0.1, vocab_size=10004):
     transformer = Transformer(
     num_layers=num_layers,
@@ -625,10 +644,11 @@ def train_model(dataset, num_layers=6, point_size=128, n_points=512, num_heads=8
     optimizer = tf.keras.optimizers.Adam(learning_rate)
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
+    class_accuracy = tf.keras.metrics.Mean(name='classification_accuracy')
+    checkpoint_path = "/store/lshimabucoro/projects/bumblebee/scratch/checkpoints/train/sketchformer-regular"
 
-    print(transformer)
-    ckp_mng = checkpoint_manager(transformer, optimizer, restore=False)
-    training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
+    ckp_mng = checkpoint_manager(transformer, optimizer, checkpoint_path, restore=False)
+    training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy, class_accuracy)
 
     training_schedule(dataset, training_obj, ckp_mng)
 
@@ -730,31 +750,33 @@ def main():
     parser.add_argument('--dataset-dir', type=str, default='/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345')
     parser.add_argument('--class-index-dict', type=str, default='/store/lshimabucoro/projects/bumblebee/scratch/datasets/quickdraw_raw_345/meta.json')
     args = parser.parse_args()
+
+    setup_gpu([0])
                                         
-    num_layers = 6
-    point_size = 128
-    n_points = 512
-    num_heads = 8
-    dropout_rate = 0.1
+    # num_layers = 6
+    # point_size = 128
+    # n_points = 512
+    # num_heads = 8
+    # dropout_rate = 0.1
 
-    transformer = Transformer(
-    num_layers=num_layers,
-    point_size=point_size,
-    num_heads=num_heads,
-    n_points=n_points,
-    input_vocab_size=10004,
-    target_vocab_size=10004,
-    pe_input=1000,
-    pe_target=1000,
-    rate=dropout_rate)
+    # transformer = Transformer(
+    # num_layers=num_layers,
+    # point_size=point_size,
+    # num_heads=num_heads,
+    # n_points=n_points,
+    # input_vocab_size=10004,
+    # target_vocab_size=10004,
+    # pe_input=1000,
+    # pe_target=1000,
+    # rate=dropout_rate)
 
-    learning_rate = CustomSchedule(point_size)
-    optimizer = tf.keras.optimizers.Adam(learning_rate)
+    # learning_rate = CustomSchedule(point_size)
+    # optimizer = tf.keras.optimizers.Adam(learning_rate)
     # train_loss = tf.keras.metrics.Mean(name='train_loss')
     # train_accuracy = tf.keras.metrics.Mean(name='train_accuracy')
 
     # print(transformer)
-    ckp_mng = checkpoint_manager(transformer, optimizer, restore=True)
+    # ckp_mng = checkpoint_manager(transformer, optimizer, restore=True)
     # training_obj = TrainingTransformer(transformer, optimizer, train_loss, train_accuracy)
 
     # training_schedule(datasets['train'], training_obj, ckp_mng)
@@ -764,23 +786,16 @@ def main():
 
 
 
-    # train_model(datasets['train'], num_layers=6, point_size=128, n_points=512, num_heads=8, dropout_rate=0.1, vocab_size=10004)
+    train_model(datasets['train'], num_layers=6, point_size=128, n_points=512, num_heads=8, dropout_rate=0.1, vocab_size=10005)
     # validate_model(datasets['valid'], transformer, optimizer)
 
-    translator = Translator(tokenizer.GridTokenizer(100, 512), transformer)
+    # translator = Translator(tokenizer.GridTokenizer(100, 512), transformer)
     
-    for batch in datasets['test']:
-        print(batch[0][5])
-        print(batch[1])
-        translator(batch[0][5])
-        break
-    # translator(example)
-    # for sketch, label in datasets['test']:
-    #     print(sketch)
-    #     for img in sketch:
-    #         print(img)
-    #         translator(img)
-    #         break
+    # for batch in datasets['test']:
+    #     print(batch[0][5])
+    #     print(batch[1])
+    #     translator(batch[0][5])
+    #     break
 
 if __name__ == "__main__":
     main()
